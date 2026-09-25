@@ -1,51 +1,17 @@
+// 接口层：HTTP 路由。规则见 rules.js，保存见 store.js。
+
 const http = require("http");
-const { readFile, writeFile, mkdir } = require("fs/promises");
-const path = require("path");
+const { readDb, writeDb } = require("./store");
+const {
+  hasTempRange,
+  validateTempRange,
+  commonWindow,
+  findConflicts,
+  conflictInfo,
+  reevaluateBatch
+} = require("./rules");
 
 const PORT = Number(process.env.PORT || 3020);
-const DB_FILE = path.join(__dirname, "data", "db.json");
-
-const initialData = {
-  rubbings: [
-    {
-      id: "rubbing_demo",
-      code: "TP-清-014",
-      source: "地方碑刻残页",
-      paperSize: "42x68cm",
-      note: "边缘有旧折痕",
-      createdAt: new Date().toISOString()
-    }
-  ],
-  damages: [
-    {
-      id: "damage_demo_1",
-      rubbingId: "rubbing_demo",
-      position: "左上角第3列题字旁",
-      type: "虫蛀孔",
-      beforePhotoUrl: "https://example.local/before-014-1.jpg",
-      afterPhotoUrl: "",
-      status: "pending",
-      repairNote: "",
-      batchId: null,
-      createdAt: new Date().toISOString(),
-      repairedAt: null
-    },
-    {
-      id: "damage_demo_2",
-      rubbingId: "rubbing_demo",
-      position: "下边缘中央",
-      type: "撕裂",
-      beforePhotoUrl: "https://example.local/before-014-2.jpg",
-      afterPhotoUrl: "",
-      status: "pending",
-      repairNote: "",
-      batchId: null,
-      createdAt: new Date().toISOString(),
-      repairedAt: null
-    }
-  ],
-  batches: []
-};
 
 const routes = [
   "GET /health",
@@ -60,24 +26,6 @@ const routes = [
   "GET /batches/:id",
   "POST /batches/:id/complete"
 ];
-
-async function ensureDb() {
-  await mkdir(path.dirname(DB_FILE), { recursive: true });
-  try {
-    JSON.parse(await readFile(DB_FILE, "utf8"));
-  } catch {
-    await writeFile(DB_FILE, JSON.stringify(initialData, null, 2));
-  }
-}
-
-async function readDb() {
-  await ensureDb();
-  return JSON.parse(await readFile(DB_FILE, "utf8"));
-}
-
-async function writeDb(data) {
-  await writeFile(DB_FILE, JSON.stringify(data, null, 2));
-}
 
 function send(res, status, body) {
   res.writeHead(status, { "Content-Type": "application/json; charset=utf-8" });
@@ -124,6 +72,8 @@ function enrichBatch(db, batch) {
   const damages = db.damages.filter((item) => batch.damageIds.includes(item.id));
   return {
     ...batch,
+    tempWindow: batch.tempWindow || null,
+    removals: batch.removals || [],
     damages,
     total: damages.length,
     repaired: damages.filter((item) => item.status === "repaired").length,
@@ -179,7 +129,9 @@ async function handle(req, res) {
     const rubbingId = rubbingDamagesMatch[1];
     findRubbing(db, rubbingId);
     const body = await parseBody(req);
-    required(body, ["position", "type", "beforePhotoUrl"]);
+    required(body, ["position", "type", "beforePhotoUrl", "tempMin", "tempMax"]);
+    const tempError = validateTempRange(body.tempMin, body.tempMax);
+    if (tempError) return send(res, 400, { error: tempError });
     const damage = {
       id: makeId("damage"),
       rubbingId,
@@ -189,6 +141,8 @@ async function handle(req, res) {
       afterPhotoUrl: "",
       status: "pending",
       repairNote: "",
+      tempMin: body.tempMin,
+      tempMax: body.tempMax,
       batchId: null,
       createdAt: new Date().toISOString(),
       repairedAt: null
@@ -210,6 +164,23 @@ async function handle(req, res) {
     const damage = db.damages.find((item) => item.id === damagePatchMatch[1]);
     if (!damage) return send(res, 404, { error: "缺损项不存在" });
     const body = await parseBody(req);
+    let batchReevaluation = null;
+    if (body.tempMin !== undefined || body.tempMax !== undefined) {
+      const nextMin = body.tempMin ?? damage.tempMin;
+      const nextMax = body.tempMax ?? damage.tempMax;
+      const tempError = validateTempRange(nextMin, nextMax);
+      if (tempError) return send(res, 400, { error: tempError });
+      const batch = damage.batchId ? db.batches.find((item) => item.id === damage.batchId) : null;
+      if (batch && batch.status === "completed") {
+        return send(res, 409, { error: "批次已完成，温度范围不许再改" });
+      }
+      damage.tempMin = nextMin;
+      damage.tempMax = nextMax;
+      if (batch) {
+        const { window, removed } = reevaluateBatch(db, batch, damage.id);
+        batchReevaluation = { batchId: batch.id, tempWindow: window, removed };
+      }
+    }
     Object.assign(damage, {
       position: body.position ?? damage.position,
       type: body.type ?? damage.type,
@@ -220,7 +191,7 @@ async function handle(req, res) {
     });
     damage.repairedAt = damage.status === "repaired" ? new Date().toISOString() : damage.repairedAt;
     await writeDb(db);
-    return send(res, 200, { data: damage });
+    return send(res, 200, { data: damage, batchReevaluation });
   }
 
   if (req.method === "GET" && pathname === "/batches") {
@@ -233,11 +204,36 @@ async function handle(req, res) {
     if (!Array.isArray(body.damageIds) || body.damageIds.length === 0) return send(res, 400, { error: "damageIds必须是非空数组" });
     const invalid = body.damageIds.filter((id) => !db.damages.find((damage) => damage.id === id));
     if (invalid.length) return send(res, 400, { error: `缺损项不存在：${invalid.join(", ")}` });
+    const members = body.damageIds.map((id) => db.damages.find((damage) => damage.id === id));
+    const unregistered = members.filter((damage) => !hasTempRange(damage));
+    if (unregistered.length) {
+      return send(res, 400, {
+        error: "存在未登记耐受温度的缺损项，请先通过 PATCH /damages/:id 登记tempMin/tempMax",
+        damages: unregistered.map((damage) => damage.id)
+      });
+    }
+    const occupied = members.filter((damage) => damage.batchId);
+    if (occupied.length) {
+      return send(res, 409, {
+        error: "缺损项已在其他批次中，批次归属不改",
+        damages: occupied.map((damage) => ({ id: damage.id, batchId: damage.batchId }))
+      });
+    }
+    const window = commonWindow(members);
+    if (!window) {
+      return send(res, 409, {
+        error: "所选缺损的耐受温度没有共同区间，批次未创建",
+        tempWindow: null,
+        conflicts: findConflicts(members).map(conflictInfo)
+      });
+    }
     const batch = {
       id: makeId("batch"),
       name: body.name,
       status: "open",
       damageIds: body.damageIds,
+      tempWindow: window,
+      removals: [],
       note: body.note || "",
       createdAt: new Date().toISOString(),
       completedAt: null
@@ -264,6 +260,7 @@ async function handle(req, res) {
   if (completeMatch && req.method === "POST") {
     const batch = db.batches.find((item) => item.id === completeMatch[1]);
     if (!batch) return send(res, 404, { error: "修补批次不存在" });
+    if (batch.status === "completed") return send(res, 409, { error: "批次已完成，不许再改" });
     const body = await parseBody(req);
     const results = Array.isArray(body.results) ? body.results : [];
     batch.status = "completed";
