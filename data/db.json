@@ -19,6 +19,8 @@
       "afterPhotoUrl": "",
       "status": "pending",
       "repairNote": "",
+      "minTemp": 55,
+      "maxTemp": 85,
       "batchId": null,
       "createdAt": "2026-06-16T00:00:00.000Z",
       "repairedAt": null
@@ -32,6 +34,8 @@
       "afterPhotoUrl": "",
       "status": "pending",
       "repairNote": "",
+      "minTemp": 60,
+      "maxTemp": 90,
       "batchId": null,
       "createdAt": "2026-06-16T00:00:00.000Z",
       "repairedAt": null
